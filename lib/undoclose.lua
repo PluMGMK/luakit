@@ -130,11 +130,14 @@ window.methods.undo_close_tab = function (w, index)
         w.tabs:reorder(view, 1)
     end
 
-    -- Emit 'undo-close' after webview init funcs have run
-    view:add_signal("web-extension-loaded", function(v)
+    -- Emit 'undo-close' after webview init funcs have run, once: the signal
+    -- comes again whenever the view moves to another web process
+    local function undo_close(v)
+        v:remove_signal("web-extension-loaded", undo_close)
         v:emit_signal("undo-close")
         reopening[view] = nil
-    end)
+    end
+    view:add_signal("web-extension-loaded", undo_close)
 end
 
 session.add_signal("save", function (state)

@@ -31,6 +31,7 @@
 #include "common/signal.h"
 #include "web_context.h"
 #include "common/ipc.h"
+#include "ipc.h"
 #include "common/luayield.h"
 
 typedef struct {
@@ -1309,6 +1310,15 @@ luakit_uri_scheme_request_cb(WebKitURISchemeRequest *request, const gchar *schem
     g_free(sig);
 }
 
+/* WebKit moves a webview's page to another web process for some navigations
+ * (on a Cross-Origin-Opener-Policy header, for one), and back to the old one
+ * for pages in the back/forward cache. */
+static void
+webview_page_id_cb(WebKitWebView *UNUSED(view), GParamSpec *UNUSED(pspec), widget_t *w)
+{
+    ipc_webview_find_endpoint(w);
+}
+
 gboolean
 webview_crashed_cb(WebKitWebView *UNUSED(view), widget_t *w)
 {
@@ -1327,16 +1337,12 @@ webview_connect_to_endpoint(widget_t *w, ipc_endpoint_t *ipc)
     g_assert(w->info->tok == L_TK_WEBVIEW);
     g_assert(ipc);
 
-    /* Replace old endpoint with new, sending queued data */
+    /* Replace old endpoint with new, sending queued data. The old one is left
+     * connected: its process may still host other pages, related webviews'
+     * or pages in the back/forward cache. */
     webview_data_t *d = w->data;
-    if(d->ipc == ipc)
+    if (d->ipc == ipc)
         return;
-    if(d->ipc->channel)
-        /* Old one has no business being connected at this point;
-         * it probably just hasn't realized that the channel is
-         * broken yet!
-         */
-        ipc_endpoint_disconnect(d->ipc);
     d->ipc = ipc_endpoint_replace(d->ipc, ipc);
 
     lua_State *L = common.L;
@@ -1435,6 +1441,7 @@ widget_webview(lua_State *L, widget_t *w, luakit_token_t UNUSED(token))
       "signal::scroll-event",                         G_CALLBACK(webview_scroll_cb),            w,
       "signal::create",                               G_CALLBACK(create_cb),                    w,
       "signal::web-process-crashed",                  G_CALLBACK(webview_crashed_cb),           w,
+      "signal::notify::page-id",                      G_CALLBACK(webview_page_id_cb),           w,
       "signal::draw",                                 G_CALLBACK(expose_cb),                    w,
       "signal::mouse-target-changed",                 G_CALLBACK(mouse_target_changed_cb),      w,
       "signal::key-press-event",                      G_CALLBACK(key_press_cb),                 w,

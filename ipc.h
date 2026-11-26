@@ -20,8 +20,11 @@
 #define LUAKIT_IPC_H
 
 #include "common/ipc.h"
+#include "clib/widget.h"
 
 void ipc_init(void);
+void ipc_webview_find_endpoint(widget_t *w);
+ipc_endpoint_t *ipc_endpoint_for_page(guint64 page_id);
 void ipc_endpoint_remove_from_endpoints(ipc_endpoint_t *);
 void ipc_remove_socket_file(void);
 

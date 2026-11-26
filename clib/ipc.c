@@ -19,6 +19,7 @@
 #include <webkit2/webkit2.h>
 #include "clib/widget.h"
 #include "common/ipc.h"
+#include "ipc.h"
 #include "widgets/webview.h"
 #include "common/luauniq.h"
 
@@ -42,8 +43,10 @@ ipc_channel_send(lua_State *L)
         lua_remove(L, 2);
     } else if (lua_isnumber(L, 2)) {
         page_id = lua_tointeger(L, 2);
-        widget_t *w = webview_get_by_id(page_id);
-        ipc = webview_get_endpoint(w);
+        /* The page may be one no webview shows any more, or gone */
+        ipc = ipc_endpoint_for_page(page_id);
+        if (!ipc)
+            return 0;
         lua_remove(L, 2);
     }
 

@@ -78,14 +78,16 @@ ipc_send_thread(gpointer UNUSED(user_data))
         ipc_header_t *header = &out->header;
         gpointer data = out->payload;
 
-        /* On any step here, the channel can disappear */
-        if((ipc->channel != NULL) && (ipc->status == IPC_ENDPOINT_CONNECTED))
+        /* The main thread closes the channel only while holding the lock. A
+         * message for a closed channel is dropped, without logging: in a web
+         * process, logging sends a message itself, from the main thread's Lua
+         * state. */
+        g_mutex_lock(&ipc->channel_lock);
+        if (ipc->channel) {
             g_io_channel_write_chars(ipc->channel, (gchar*)header, sizeof(*header), NULL, NULL);
-
-        if((ipc->channel != NULL) && (ipc->status == IPC_ENDPOINT_CONNECTED))
             g_io_channel_write_chars(ipc->channel, (gchar*)data, header->length, NULL, NULL);
-        else
-            error("Trying to send an ipc message, but the endpoint went away.");
+        }
+        g_mutex_unlock(&ipc->channel_lock);
 
         /* Remove keep-alive reference */
         ipc_endpoint_decref(ipc);
@@ -104,10 +106,6 @@ ipc_send(ipc_endpoint_t *ipc, const ipc_header_t *header, const void *data)
         send_thread = g_thread_new("send_thread", ipc_send_thread, NULL);
     }
 
-    /* Keep the endpoint alive while the message is being sent */
-    if (!ipc_endpoint_incref(ipc))
-        return;
-
     if (header->type != IPC_TYPE_log)
         debug("Process '%s': send " ANSI_COLOR_BLUE "%s" ANSI_COLOR_RESET " message",
                 ipc->name, ipc_type_name(header->type));
@@ -121,10 +119,24 @@ ipc_send(ipc_endpoint_t *ipc, const ipc_header_t *header, const void *data)
     if (header->length)
         memcpy(msg->payload, data, header->length);
 
-    if (ipc->channel)
+    if (ipc->channel) {
+        /* Keep the endpoint alive until the send thread is done with it */
+        ipc_endpoint_incref_no_check(ipc);
         g_async_queue_push(send_queue, msg);
-    else
+    } else
+        /* Owned by the endpoint; see ipc_endpoint_replace() */
         g_queue_push_tail(ipc->queue, msg);
+}
+
+/* The other end has gone away: disconnect, and let the process decide what
+ * becomes of the endpoint. */
+static void
+ipc_endpoint_lost(ipc_endpoint_t *ipc)
+{
+    if (ipc->status != IPC_ENDPOINT_CONNECTED)
+        return;
+    ipc_endpoint_disconnect(ipc);
+    ipc_endpoint_closed(ipc);
 }
 
 static void
@@ -154,13 +166,15 @@ ipc_recv_and_dispatch_or_enqueue(ipc_endpoint_t *ipc)
              * If we do not close the socket, glib will continue to
              * call the G_IO_IN handler.
              */
-            ipc_endpoint_disconnect(ipc);
+            ipc_endpoint_lost(ipc);
             return;
         case G_IO_STATUS_ERROR:
             if (!g_str_equal(ipc->name, "UI"))
             if (!g_str_equal(error->message, "Connection reset by peer"))
                 error("g_io_channel_read_chars(): %s", error->message);
             g_error_free(error);
+            /* Nothing more can be read; otherwise G_IO_IN keeps firing */
+            ipc_endpoint_lost(ipc);
             return;
         default:
             g_assert_not_reached();
@@ -183,14 +197,17 @@ ipc_recv_and_dispatch_or_enqueue(ipc_endpoint_t *ipc)
         return;
     }
 
-    /* Otherwise, we finished downloading the message */
-    ipc_dispatch(ipc, state->hdr, state->payload);
-    g_free(state->payload);
-
-    /* Reset state for the next message */
+    /* Otherwise, we finished downloading the message. Reset the state for
+     * the next one first: a handler that runs a nested main loop (a file
+     * dialog, for one) can receive it, or disconnect the endpoint. */
+    ipc_header_t hdr = state->hdr;
+    gpointer payload = state->payload;
     state->payload = NULL;
     state->bytes_read = 0;
     state->hdr_done = FALSE;
+
+    ipc_dispatch(ipc, hdr, payload);
+    g_free(payload);
 }
 
 /* Callback function for channel watch */
@@ -209,9 +226,11 @@ ipc_recv(GIOChannel *UNUSED(channel), GIOCondition UNUSED(cond), ipc_endpoint_t 
 static gboolean
 ipc_hup(GIOChannel *UNUSED(channel), GIOCondition UNUSED(cond), ipc_endpoint_t *ipc)
 {
-    g_assert(ipc->status == IPC_ENDPOINT_CONNECTED);
-    g_assert(ipc->channel);
-    ipc_endpoint_disconnect(ipc);
+    /* Keep the endpoint alive until the handler returns */
+    if (!ipc_endpoint_incref(ipc))
+        return TRUE;
+    ipc_endpoint_lost(ipc);
+    ipc_endpoint_decref(ipc);
     return TRUE;
 }
 
@@ -232,6 +251,7 @@ ipc_endpoint_new(const gchar *name)
 
     ipc->name = (gchar*)name;
     ipc->queue = g_queue_new();
+    g_mutex_init(&ipc->channel_lock);
     ipc->status = IPC_ENDPOINT_DISCONNECTED;
     ipc->refcount = 1;
     ipc->creation_notified = FALSE;
@@ -252,7 +272,8 @@ ipc_endpoint_incref(ipc_endpoint_t *ipc)
     return TRUE;
 }
 
-static void
+/* For callers that already hold a reference */
+void
 ipc_endpoint_incref_no_check(ipc_endpoint_t *ipc)
 {
     g_atomic_int_inc(&ipc->refcount);
@@ -263,15 +284,13 @@ ipc_endpoint_decref(ipc_endpoint_t *ipc)
 {
     if (!g_atomic_int_dec_and_test(&ipc->refcount))
         return;
-    if (ipc->status == IPC_ENDPOINT_CONNECTED)
-        ipc_endpoint_disconnect(ipc);
-    if (ipc->queue) {
-        while (!g_queue_is_empty(ipc->queue)) {
-            queued_ipc_t *msg = g_queue_pop_head(ipc->queue);
-            g_free(msg);
-        }
-        g_queue_free(ipc->queue);
-    }
+    /* An open connection holds a reference of its own, so the endpoint can
+     * only be freed once disconnected, and this may run on the send thread */
+    g_assert(ipc->status == IPC_ENDPOINT_DISCONNECTED);
+    while (!g_queue_is_empty(ipc->queue))
+        g_free(g_queue_pop_head(ipc->queue));
+    g_queue_free(ipc->queue);
+    g_mutex_clear(&ipc->channel_lock);
     ipc->status = IPC_ENDPOINT_FREED;
     g_slice_free(ipc_endpoint_t, ipc);
     debug("Freeing IPC endpoint 0x%lx", (unsigned long)ipc);
@@ -284,7 +303,6 @@ ipc_endpoint_connect_to_socket(ipc_endpoint_t *ipc, int sock)
     g_assert(ipc->status == IPC_ENDPOINT_DISCONNECTED);
 
     ipc_recv_state_t *state = &ipc->recv_state;
-    state->queued_ipcs = g_ptr_array_new();
 
     GIOChannel *channel = g_io_channel_unix_new(sock);
     g_io_channel_set_encoding(channel, NULL, NULL);
@@ -308,40 +326,28 @@ ipc_endpoint_connect_to_socket(ipc_endpoint_t *ipc, int sock)
     g_ptr_array_add(endpoints, ipc);
 }
 
+/* Moves a reference from orig to new, for a webview whose page has moved to
+ * another web process (or whose first page has been created). orig may still
+ * be connected, if its process hosts other pages; messages queued on it while
+ * it was disconnected are sent to new. Returns new. */
 ipc_endpoint_t *
 ipc_endpoint_replace(ipc_endpoint_t *orig, ipc_endpoint_t *new)
 {
     g_assert(orig);
     g_assert(new);
-    g_assert(orig->status == IPC_ENDPOINT_DISCONNECTED);
     g_assert(new->status == IPC_ENDPOINT_CONNECTED);
 
-    /* Send all queued messages */
-    if (orig->queue) {
-        while (!g_queue_is_empty(orig->queue)) {
-            queued_ipc_t *msg = g_queue_pop_head(orig->queue);
-            msg->ipc = new;
-            /* When this message was originally added to orig's
-             * queue, the refcount was incremented, so transfer
-             * that reference to new.
-             */
-            ipc_endpoint_decref(orig);
-            ipc_endpoint_incref_no_check(new);
-            g_async_queue_push(send_queue, msg);
-        }
+    ipc_endpoint_incref_no_check(new);
 
-        g_queue_free(orig->queue);
-        orig->queue = NULL;
+    while (!g_queue_is_empty(orig->queue)) {
+        queued_ipc_t *msg = g_queue_pop_head(orig->queue);
+        msg->ipc = new;
+        /* Keep-alive reference for the send thread */
+        ipc_endpoint_incref_no_check(new);
+        g_async_queue_push(send_queue, msg);
     }
 
-    /* Presumably this will result in orig being freed: */
     ipc_endpoint_decref(orig);
-    /* Meanwhile, new's refcount will come back down to
-     * 1 as the send thread fires off all the messages
-     * we added to the queue. If the owner needs more
-     * references, it can increment the refcount after
-     * this function returns. A priori, 1 is enough.
-     */
     return new;
 }
 
@@ -353,15 +359,23 @@ ipc_endpoint_disconnect(ipc_endpoint_t *ipc)
 
     g_ptr_array_remove_fast(endpoints, ipc);
 
-    /* Remove watches */
+    /* Remove watches, and drop any partly received message */
     ipc_recv_state_t *state = &ipc->recv_state;
     g_source_remove(state->watch_in_id);
     g_source_remove(state->watch_hup_id);
+    g_free(state->payload);
+    state->payload = NULL;
+
+    /* Waits for a write in progress on the send thread to finish */
+    g_mutex_lock(&ipc->channel_lock);
+    GIOChannel *channel = ipc->channel;
+    ipc->channel = NULL;
+    ipc->status = IPC_ENDPOINT_DISCONNECTED;
+    g_mutex_unlock(&ipc->channel_lock);
 
     /* Close channel */
-    g_io_channel_shutdown(ipc->channel, TRUE, NULL);
-    ipc->status = IPC_ENDPOINT_DISCONNECTED;
-    ipc->channel = NULL;
+    g_io_channel_shutdown(channel, TRUE, NULL);
+    g_io_channel_unref(channel);
 }
 
 // vim: ft=c:et:sw=4:ts=8:sts=4:tw=80

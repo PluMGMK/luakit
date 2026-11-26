@@ -105,6 +105,8 @@ void
 web_scroll_to(guint64 page_id, gint scroll_x, gint scroll_y)
 {
     WebKitWebPage *page = webkit_web_extension_get_page(extension.ext, page_id);
+    if (!page)
+        return;
     WebKitDOMDocument *document = webkit_web_page_get_dom_document(page);
     WebKitDOMDOMWindow *window = webkit_dom_document_get_default_view(document);
 

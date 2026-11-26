@@ -290,7 +290,10 @@
 
 --- @signal web-extension-loaded
 -- Emitted on a `webview` widget when its associated web process has finished
--- initialization.
+-- initialization. It is emitted again whenever the `webview` moves to another
+-- web process: WebKit moves a page to a new process on some navigations (for
+-- one, to a page with a `Cross-Origin-Opener-Policy` header), and back to its
+-- old process when going back to a page it has kept in that process.
 
 --- @signal crashed
 -- Emitted on a `webview` widget when its associated web process has crashed.

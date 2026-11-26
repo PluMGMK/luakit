@@ -93,7 +93,6 @@ ipc_type_name(ipc_type_t type)
 
 typedef struct _ipc_recv_state_t {
     guint watch_in_id, watch_hup_id;
-    GPtrArray *queued_ipcs;
 
     ipc_header_t hdr;
     gpointer payload;
@@ -114,11 +113,18 @@ typedef struct _ipc_endpoint_t {
     ipc_endpoint_status_t status;
     /** Channel for IPC with web process */
     GIOChannel *channel;
-    /** Queued data for when channel is not yet open */
+    /** Held by the send thread while writing, and while the channel is
+     * closed, so that it never writes to a closed channel */
+    GMutex channel_lock;
+    /** Messages sent while the endpoint is disconnected; they are sent when
+     * a webview moves to another endpoint (see ipc_endpoint_replace()) */
     GQueue *queue;
     /** Incoming message bookkeeping data */
     ipc_recv_state_t recv_state;
-    /** Refcount: number of webviews + number of unsent messages */
+    /** Refcount: one for the creator (on the UI side, the open connection
+     * or the webview that created the endpoint), one for each webview using
+     * it, one for each page the UI knows the endpoint hosts, and one for each
+     * message waiting for the send thread */
     gint refcount;
     /** Whether the endpoint creation signal has been emitted */
     gboolean creation_notified;
@@ -129,7 +135,13 @@ void ipc_endpoint_connect_to_socket(ipc_endpoint_t *ipc, int sock);
 ipc_endpoint_t * ipc_endpoint_replace(ipc_endpoint_t *orig, ipc_endpoint_t *new);
 void ipc_endpoint_disconnect(ipc_endpoint_t *ipc);
 
+/** Called once the other end of a connected endpoint has gone away and the
+ * endpoint has been disconnected; implemented separately by the UI and web
+ * processes */
+void ipc_endpoint_closed(ipc_endpoint_t *ipc);
+
 WARN_UNUSED gboolean ipc_endpoint_incref(ipc_endpoint_t *ipc);
+void ipc_endpoint_incref_no_check(ipc_endpoint_t *ipc);
 void ipc_endpoint_decref(ipc_endpoint_t *ipc);
 
 const GPtrArray *ipc_endpoints_get(void);

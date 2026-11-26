@@ -96,8 +96,11 @@ ipc_recv_eval_js(ipc_endpoint_t *UNUSED(ipc), const guint8 *msg, guint length)
 
     WebKitWebPage *page = webkit_web_extension_get_page(extension.ext, page_id);
     if (!page) {
-        /* Notify UI to free callback ref */
-        ipc_send_lua(extension.ipc, IPC_TYPE_eval_js, L, -2, -1);
+        /* Report an error, so the callback isn't left waiting forever, and
+         * the UI frees its ref */
+        lua_pushnil(L);
+        lua_pushstring(L, "the page is not in this web process");
+        ipc_send_lua(extension.ipc, IPC_TYPE_eval_js, L, -4, -1);
         lua_settop(L, top);
         return;
     }
@@ -148,6 +151,12 @@ web_page_created_cb(WebKitWebExtension *UNUSED(ext), WebKitWebPage *web_page, gp
         g_ptr_array_add(queued_page_ipc, web_page);
     else
         emit_page_created_ipc(web_page, NULL);
+}
+
+void
+ipc_endpoint_closed(ipc_endpoint_t *UNUSED(ipc))
+{
+    /* The UI process has gone away; WebKit ends this process soon after */
 }
 
 int
